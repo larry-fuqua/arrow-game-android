@@ -460,6 +460,26 @@ private fun dirBetween(a: Pair<Int, Int>, b: Pair<Int, Int>): Int? {
     return null
 }
 
+/**
+ * Head / exit direction for drawing and play.
+ *
+ * Multi-cell arrows: always the last shaft step (no tip elbow).
+ * Unit arrows: stored exitDir.
+ */
+fun headDirection(cells: List<Pair<Int, Int>>, exitDir: Int): Int {
+    if (cells.size >= 2) {
+        return dirBetween(cells[cells.size - 2], cells.last()) ?: exitDir
+    }
+    return exitDir
+}
+
+/**
+ * Choose exit direction.
+ *
+ * Multi-cell paths may *only* exit continuing the final shaft step — the
+ * triangle head is never drawn as a combined elbow/turn at the tip.
+ * Unit cells may use any clear direction.
+ */
 private fun pickExitDir(
     head: Pair<Int, Int>,
     remainingAfter: Set<Pair<Int, Int>>,
@@ -469,13 +489,20 @@ private fun pickExitDir(
     preferred: Int? = null,
     path: List<Pair<Int, Int>>? = null,
 ): Int? {
-    val order = ArrayList<Int>()
-    if (path != null && path.size >= 2) {
-        dirBetween(path[path.size - 2], path.last())?.let { order.add(it) }
-    }
-    if (preferred != null && preferred !in order) order.add(preferred)
-    for (d in 0 until 4) if (d !in order) order.add(d)
     val pathCells = path ?: listOf(head)
+    // Multi-cell: last step only (no tip turn)
+    if (path != null && path.size >= 2) {
+        val last = dirBetween(path[path.size - 2], path.last()) ?: return null
+        if (!canStepOut(head.first, head.second, last, remainingAfter, shape, height, width)) return null
+        if (exitHitsOwn(pathCells, last, height, width, shape)) return null
+        val (dr, dc, _) = DIRS[last]
+        if ((head.first + dr to head.second + dc) in remainingAfter) return null
+        return last
+    }
+    // Unit: preferred first, then any clear exit
+    val order = ArrayList<Int>()
+    if (preferred != null) order.add(preferred)
+    for (d in 0 until 4) if (d !in order) order.add(d)
     for (d in order) {
         if (!canStepOut(head.first, head.second, d, remainingAfter, shape, height, width)) continue
         if (exitHitsOwn(pathCells, d, height, width, shape)) continue
@@ -483,6 +510,13 @@ private fun pickExitDir(
         if ((head.first + dr to head.second + dc) !in remainingAfter) return d
     }
     return null
+}
+
+/** True if multi-cell path's last step matches [exitDir] (unit always ok). */
+private fun exitAlignsWithFinalSegment(path: List<Pair<Int, Int>>, exitDir: Int): Boolean {
+    if (path.size < 2) return true
+    val last = dirBetween(path[path.size - 2], path.last()) ?: return false
+    return last == exitDir
 }
 
 fun coverShapeWithArrows(
@@ -518,8 +552,15 @@ fun coverShapeWithArrows(
             holeCells = if (holes.isNotEmpty()) holes else null,
         )
         if (placed != null) {
-            path = placed.first
-            exitDir = placed.second
+            val pth = placed.first
+            // Re-resolve exit so multi-cell paths never tip-turn
+            val ed = pickExitDir(
+                pth.last(), remaining - pth.toSet(), shape, height, width, placed.second, pth,
+            )
+            if (ed != null) {
+                path = pth
+                exitDir = ed
+            }
         }
 
         if (path == null) {
@@ -566,21 +607,23 @@ fun coverShapeWithArrows(
             exitDir = unit.second
         }
 
+        // Final exit must continue the last segment (no tip elbow for multi-cell).
         var ed = pickExitDir(
             clean.last(), remaining - clean.toSet(), shape, height, width, exitDir, clean,
         )
         if (ed == null ||
             !canStepOut(clean.last().first, clean.last().second, ed, remaining - clean.toSet(), shape, height, width) ||
-            exitHitsOwn(clean, ed, height, width, shape)
+            exitHitsOwn(clean, ed, height, width, shape) ||
+            !exitAlignsWithFinalSegment(clean, ed)
         ) {
-            val unit = fallbackUnit(remaining, shape, height, width) ?: break
+            val unit = fallbackUnit(remaining, shape, height, width) ?: continue
             clean.clear()
             clean.addAll(unit.first)
             ed = unit.second
             if (ed == null ||
                 !canStepOut(clean.last().first, clean.last().second, ed, remaining - clean.toSet(), shape, height, width) ||
                 exitHitsOwn(clean, ed, height, width, shape)
-            ) break
+            ) continue
         }
 
         val isHole = holes.isNotEmpty() && clean.isNotEmpty() && clean.all { inHole(it, holes) }

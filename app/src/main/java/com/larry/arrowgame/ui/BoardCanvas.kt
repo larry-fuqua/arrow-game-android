@@ -29,6 +29,7 @@ import com.larry.arrowgame.game.Config
 import com.larry.arrowgame.game.DIRS
 import com.larry.arrowgame.game.FlowAnim
 import com.larry.arrowgame.game.Puzzle
+import com.larry.arrowgame.game.headDirection
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -296,12 +297,24 @@ fun BoardCanvas(
 
         for (arrow in puzzle.arrows) {
             if (arrow.removed) continue
+            val selected = hoverArrowId == arrow.id
             val color = arrowColor(arrow, hoverArrowId, errorArrowId, errorBlinkOn)
             val centers = arrow.cells.map { (r, c) ->
                 val o = layout.cellToScreen(r, c)
                 o.x to o.y
             }
-            drawPolylineArrow(centers, arrow.exitDirection(), color, cs)
+            val headDir = headDirection(arrow.cells, arrow.exitDir)
+            // Halo + thicker stroke so select reads clearly on dense Expert grids
+            if (selected) {
+                drawPolylineArrow(
+                    centers, headDir, Config.ARROW_SELECT_GLOW.copy(alpha = 0.55f), cs,
+                    thicknessScale = 1.85f,
+                )
+            }
+            drawPolylineArrow(
+                centers, headDir, color, cs,
+                thicknessScale = if (selected) 1.35f else 1f,
+            )
         }
 
         for (anim in flowAnims) {
@@ -347,17 +360,23 @@ private fun arrowColor(
     return base
 }
 
+/**
+ * Draw shaft + elbows + head.
+ *
+ * The triangle head is never a combined tip-elbow: multi-cell arrows always
+ * continue the final shaft segment into the head. Any turn must be a normal
+ * elbow on an earlier cell.
+ */
 private fun DrawScope.drawPolylineArrow(
     centers: List<Pair<Float, Float>>,
     exitDirection: Int,
     color: Color,
     cs: Float,
+    thicknessScale: Float = 1f,
 ) {
     if (centers.isEmpty()) return
     var m = Config.glyphMetrics(cs.roundToInt().coerceAtLeast(1))
-    val thickness = max(2f, m.line)
-    val (dr, dc, _) = DIRS[exitDirection]
-    val exitAng = atan2(dr.toFloat(), dc.toFloat())
+    val thickness = max(2f, m.line * thicknessScale)
     val maxReach = cs * 0.46f
     val headLen = min(m.headLen, maxReach * 0.7f)
     val headWing = minOf(m.headWing, cs * 0.38f, headLen * 1.15f)
@@ -376,34 +395,45 @@ private fun DrawScope.drawPolylineArrow(
         return kotlin.math.abs(u.first - v.first) > 0.01f || kotlin.math.abs(u.second - v.second) > 0.01f
     }
 
+    // Head always continues the final segment (never turns at the tip).
+    val headDir: Int
+    val headAng: Float
+    if (centers.size == 1) {
+        headDir = exitDirection
+        val (dr, dc, _) = DIRS[headDir]
+        headAng = atan2(dr.toFloat(), dc.toFloat())
+    } else {
+        val (lastUx, lastUy) = unitFromTo(centers[centers.size - 2], centers.last())
+        headAng = atan2(lastUy, lastUx)
+        // Snap to nearest cardinal for the polygon head
+        headDir = when {
+            kotlin.math.abs(lastUx) >= kotlin.math.abs(lastUy) && lastUx >= 0f -> 1 // E
+            kotlin.math.abs(lastUx) >= kotlin.math.abs(lastUy) -> 3 // W
+            lastUy >= 0f -> 2 // S
+            else -> 0 // N
+        }
+    }
+
     if (centers.size == 1) {
         val (hx, hy) = centers[0]
-        val back = (hx - cos(exitAng) * m.unitTail) to (hy - sin(exitAng) * m.unitTail)
-        val neck = (hx + cos(exitAng) * m.neckInset) to (hy + sin(exitAng) * m.neckInset)
+        val back = (hx - cos(headAng) * m.unitTail) to (hy - sin(headAng) * m.unitTail)
+        val neck = (hx + cos(headAng) * m.neckInset) to (hy + sin(headAng) * m.neckInset)
         drawShaft(back, neck, color, thickness)
         drawCircle(color, thickness / 2f, Offset(back.first, back.second))
-        drawArrowHead(neck, exitDirection, color, m)
+        drawArrowHead(neck, headDir, color, m)
         return
     }
 
     val (ux, uy) = unitFromTo(centers[0], centers[1])
     val tail = (centers[0].first - ux * m.tailOverhang) to (centers[0].second - uy * m.tailOverhang)
-    val (lastUx, lastUy) = unitFromTo(centers[centers.size - 2], centers.last())
-    val lastAng = atan2(lastUy, lastUx)
-    val delta = lastAng - exitAng
-    val wrapped = kotlin.math.abs(((delta + Math.PI.toFloat()) % (2f * Math.PI.toFloat()) + (2f * Math.PI.toFloat())) % (2f * Math.PI.toFloat()) - Math.PI.toFloat())
-    val exitMatches = wrapped < 0.2f
-    val neck = (centers.last().first + cos(exitAng) * m.neckInset) to
-        (centers.last().second + sin(exitAng) * m.neckInset)
+    // Extend tip slightly past the head center along the final segment only
+    val neck = (centers.last().first + cos(headAng) * m.neckInset) to
+        (centers.last().second + sin(headAng) * m.neckInset)
 
-    val pts = ArrayList<Pair<Float, Float>>()
+    val pts = ArrayList<Pair<Float, Float>>(centers.size + 2)
     pts.add(tail)
     pts.addAll(centers)
-    if (exitMatches) {
-        pts[pts.lastIndex] = neck
-    } else {
-        pts.add(neck)
-    }
+    pts[pts.lastIndex] = neck // replace head center with neck (straight, no tip turn)
 
     var runStart = 0
     for (i in 1 until pts.size - 1) {
@@ -415,7 +445,7 @@ private fun DrawScope.drawPolylineArrow(
     }
     drawShaft(pts[runStart], pts.last(), color, thickness)
     drawCircle(color, thickness / 2f, Offset(tail.first, tail.second))
-    drawArrowHead(pts.last(), exitDirection, color, m)
+    drawArrowHead(pts.last(), headDir, color, m)
 }
 
 private fun DrawScope.drawShaft(a: Pair<Float, Float>, b: Pair<Float, Float>, color: Color, thickness: Float) {

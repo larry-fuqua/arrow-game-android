@@ -306,7 +306,11 @@ private fun CelebrateScreen(vm: GameViewModel) {
     val c = vm.completion
     val tick = vm.frameTick
     Box(
-        Modifier.fillMaxSize().background(Config.BG),
+        Modifier
+            .fillMaxSize()
+            .background(Config.BG)
+            // Tap anywhere to skip the fireworks wait
+            .clickable { vm.finishCelebration() },
         contentAlignment = Alignment.Center,
     ) {
         Canvas(Modifier.fillMaxSize()) {
@@ -341,6 +345,8 @@ private fun CelebrateScreen(vm: GameViewModel) {
             } else {
                 Text("Time bonus  +0", color = Config.TEXT_DIM, fontSize = 20.sp)
             }
+            Spacer(Modifier.height(16.dp))
+            Text("Tap to continue", color = Config.TEXT_DIM, fontSize = 13.sp)
         }
     }
 }

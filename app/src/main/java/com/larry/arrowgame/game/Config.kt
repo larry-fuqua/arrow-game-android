@@ -41,9 +41,12 @@ object Config {
     val HOLE_FILL = Color(0xFF342A48)
     val HOLE_EDGE = Color(0xFF6E5A96)
     val ARROW_BODY = Color(0xFFD2AF5A)
-    val ARROW_HOVER = Color(0xFFFFE68C)
+    // Strong select highlight — bright white-gold / hot lilac vs muted body colors
+    val ARROW_HOVER = Color(0xFFFFFF66)
     val ARROW_HOLE = Color(0xFFAA82E6)
-    val ARROW_HOLE_HOVER = Color(0xFFD2B4FF)
+    val ARROW_HOLE_HOVER = Color(0xFFFF99FF)
+    /** Soft halo drawn under a selected arrow for extra pop. */
+    val ARROW_SELECT_GLOW = Color(0xFFFFFFFF)
     val ARROW_ERROR = Color(0xFFFF4650)
     val ARROW_FLOW = Color(0xFF46D278)
     val ARROW_FLOW_LINE = Color(0xFF5AEB8C)
