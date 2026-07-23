@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Rounded gold box -->
+    <path
+        android:fillColor="#1E2738"
+        android:pathData="M22,22h64a12,12 0 0 1 12,12v64a12,12 0 0 1 -12,12h-64a12,12 0 0 1 -12,-12v-64a12,12 0 0 1 12,-12z" />
+    <path
+        android:fillColor="#D2AF5A"
+        android:pathData="M30,30h48a8,8 0 0 1 8,8v48a8,8 0 0 1 -8,8h-48a8,8 0 0 1 -8,-8v-48a8,8 0 0 1 8,-8z" />
+    <!-- Arrow shaft -->
+    <path
+        android:fillColor="#121620"
+        android:pathData="M36,52h28v8h-28z" />
+    <!-- Arrow head -->
+    <path
+        android:fillColor="#121620"
+        android:pathData="M62,42 L82,56 L62,70 Z" />
+</vector>
