@@ -3,9 +3,14 @@ package com.larry.arrowgame.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -18,12 +23,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import android.os.SystemClock
 import com.larry.arrowgame.game.Arrow
 import com.larry.arrowgame.game.Config
 import com.larry.arrowgame.game.DIRS
@@ -154,6 +161,54 @@ private fun cellAt(
     return r to c
 }
 
+/** Min / max zoom for fat-finger assist. */
+private const val MIN_ZOOM = 1f
+private const val MAX_ZOOM = 4.5f
+
+/**
+ * View transform: scale around canvas pivot, then pan.
+ * screen = (world - pivot) * scale + pivot + pan
+ */
+private fun screenToWorld(
+    screen: Offset,
+    pan: Offset,
+    scale: Float,
+    pivot: Offset,
+): Offset {
+    val s = scale.coerceAtLeast(0.001f)
+    return Offset(
+        (screen.x - pan.x - pivot.x) / s + pivot.x,
+        (screen.y - pan.y - pivot.y) / s + pivot.y,
+    )
+}
+
+private fun clampPan(
+    pan: Offset,
+    scale: Float,
+    canvasW: Float,
+    canvasH: Float,
+    layout: BoardLayout,
+    pivot: Offset,
+): Offset {
+    if (scale <= 1.02f || layout.boardW <= 0f) return Offset.Zero
+    // Keep at least this much of the board frame overlapping the viewport.
+    val margin = min(canvasW, canvasH) * 0.12f
+    val bl = layout.boardLeft
+    val bt = layout.boardTop
+    val br = bl + layout.boardW
+    val bb = bt + layout.boardH
+    // screenX = (worldX - pivot.x) * scale + pivot.x + pan.x
+    val minPanX = margin - (br - pivot.x) * scale - pivot.x
+    val maxPanX = canvasW - margin - (bl - pivot.x) * scale - pivot.x
+    val minPanY = margin - (bb - pivot.y) * scale - pivot.y
+    val maxPanY = canvasH - margin - (bt - pivot.y) * scale - pivot.y
+    val loX = min(minPanX, maxPanX)
+    val hiX = max(minPanX, maxPanX)
+    val loY = min(minPanY, maxPanY)
+    val hiY = max(minPanY, maxPanY)
+    return Offset(pan.x.coerceIn(loX, hiX), pan.y.coerceIn(loY, hiY))
+}
+
 @Composable
 fun BoardCanvas(
     modifier: Modifier = Modifier,
@@ -171,6 +226,7 @@ fun BoardCanvas(
     // Essentially fill the canvas: 1dp margin, 2dp frame chrome.
     val outerMarginPx = with(density) { 1.dp.toPx() }
     val frameChromePx = with(density) { 2.dp.toPx() }
+    val panSlopPx = with(density) { 18.dp.toPx() }
 
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     val layout = remember(
@@ -194,52 +250,194 @@ fun BoardCanvas(
         }
     }
 
+    // Pinch-zoom + pan (board-local; resets on new puzzle).
+    var scale by remember { mutableFloatStateOf(1f) }
+    var pan by remember { mutableStateOf(Offset.Zero) }
+    var lastTapMs by remember { mutableLongStateOf(0L) }
+    var lastTapPos by remember { mutableStateOf(Offset.Zero) }
+
+    LaunchedEffect(puzzle.seed, puzzle.shapeName, puzzle.width, puzzle.height) {
+        scale = 1f
+        pan = Offset.Zero
+        lastTapMs = 0L
+    }
+
     val latestLayout by rememberUpdatedState(layout)
     val latestPuzzle by rememberUpdatedState(puzzle)
     val latestOnSelect by rememberUpdatedState(onCellSelect)
     val latestOnHover by rememberUpdatedState(onHoverCell)
     val latestOnLayout by rememberUpdatedState(onLayout)
+    val latestScale by rememberUpdatedState(scale)
+    val latestPan by rememberUpdatedState(pan)
+    val latestCanvas by rememberUpdatedState(canvasSize)
 
     LaunchedEffect(layout.cellSize, layout.viewCols, layout.viewRows, layout.boardW) {
         if (layout.boardW > 0f) latestOnLayout(layout)
     }
 
+    fun pivotOf(size: IntSize): Offset =
+        Offset(size.width / 2f, size.height / 2f)
+
+    fun toWorld(screen: Offset): Offset {
+        val sz = latestCanvas
+        if (sz.width <= 0) return screen
+        return screenToWorld(screen, latestPan, latestScale, pivotOf(sz))
+    }
+
+    fun applyZoom(zoomChange: Float, centroid: Offset) {
+        val sz = latestCanvas
+        if (sz.width <= 0) return
+        val pivot = pivotOf(sz)
+        val oldScale = scale
+        val newScale = (oldScale * zoomChange).coerceIn(MIN_ZOOM, MAX_ZOOM)
+        if (newScale == oldScale) return
+        // Keep the world point under the centroid fixed while scaling.
+        val worldUnder = screenToWorld(centroid, pan, oldScale, pivot)
+        // newPan such that worldUnder stays under centroid:
+        // centroid = (worldUnder - pivot) * newScale + pivot + newPan
+        val newPan = Offset(
+            centroid.x - (worldUnder.x - pivot.x) * newScale - pivot.x,
+            centroid.y - (worldUnder.y - pivot.y) * newScale - pivot.y,
+        )
+        scale = newScale
+        pan = if (newScale <= 1.02f) {
+            Offset.Zero
+        } else {
+            clampPan(newPan, newScale, sz.width.toFloat(), sz.height.toFloat(), latestLayout, pivot)
+        }
+    }
+
+    fun applyPan(delta: Offset) {
+        val sz = latestCanvas
+        if (sz.width <= 0 || scale <= 1.02f) return
+        val pivot = pivotOf(sz)
+        pan = clampPan(
+            pan + delta,
+            scale,
+            sz.width.toFloat(),
+            sz.height.toFloat(),
+            latestLayout,
+            pivot,
+        )
+    }
+
     Canvas(
         modifier = modifier
             .onSizeChanged { canvasSize = it }
-            .pointerInput(puzzle.width, puzzle.height, puzzle.shape.size) {
+            .pointerInput(puzzle.width, puzzle.height, puzzle.shape.size, puzzle.seed) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     down.consume()
 
-                    fun reportHover(pos: Offset) {
-                        val cell = cellAt(pos.x, pos.y, latestLayout, latestPuzzle)
+                    var multiTouch = false
+                    var panning = false
+                    var pastSlop = false
+                    var dragDistance = 0f
+                    var lastWorldPos = toWorld(down.position)
+                    val downScreen = down.position
+
+                    fun reportHover(screen: Offset) {
+                        val w = toWorld(screen)
+                        val cell = cellAt(w.x, w.y, latestLayout, latestPuzzle)
                         if (cell == null) latestOnHover(null, null)
                         else latestOnHover(cell.first, cell.second)
                     }
 
+                    // Start as potential select
                     reportHover(down.position)
 
-                    var lastPos = down.position
-                    val pointerId = down.id
                     while (true) {
                         val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == pointerId }
-                            ?: event.changes.firstOrNull()
-                            ?: break
-                        lastPos = change.position
-                        if (change.pressed) {
-                            reportHover(change.position)
-                            change.consume()
-                        }
-                        if (change.changedToUp()) {
-                            change.consume()
-                            val cell = cellAt(lastPos.x, lastPos.y, latestLayout, latestPuzzle)
-                            if (cell != null) latestOnSelect(cell.first, cell.second)
+                        val pressed = event.changes.filter { it.pressed }
+
+                        if (pressed.size >= 2) {
+                            multiTouch = true
+                            panning = true // no select after pinch
+                            latestOnHover(null, null)
+                            val zoomChange = event.calculateZoom()
+                            val centroid = event.calculateCentroid(useCurrent = true)
+                            if (centroid != Offset.Unspecified) {
+                                if (zoomChange != 1f) {
+                                    applyZoom(zoomChange, centroid)
+                                }
+                                // Two-finger pan via centroid movement
+                                val panChange = event.calculatePan()
+                                if (panChange != Offset.Zero) {
+                                    applyPan(panChange)
+                                }
+                            }
+                            event.changes.forEach {
+                                if (it.positionChanged()) it.consume()
+                            }
+                        } else if (pressed.size == 1) {
+                            val change = pressed[0]
+                            val screenPos = change.position
+                            if (multiTouch) {
+                                // Residual single finger after pinch — pan only if still zoomed
+                                val panChange = change.position - change.previousPosition
+                                if (latestScale > 1.02f) applyPan(panChange)
+                                change.consume()
+                            } else {
+                                val delta = (screenPos - down.position).getDistance()
+                                dragDistance = max(dragDistance, delta)
+                                if (!pastSlop && dragDistance > panSlopPx) {
+                                    pastSlop = true
+                                    // When zoomed, large drag becomes pan; otherwise stay on select.
+                                    if (latestScale > 1.02f) {
+                                        panning = true
+                                        latestOnHover(null, null)
+                                    }
+                                }
+                                if (panning && latestScale > 1.02f) {
+                                    val panChange = change.position - change.previousPosition
+                                    applyPan(panChange)
+                                } else {
+                                    // Select / highlight in board space
+                                    reportHover(screenPos)
+                                    lastWorldPos = toWorld(screenPos)
+                                }
+                                change.consume()
+                            }
+                        } else {
+                            // All pointers up
+                            val upChange = event.changes.firstOrNull()
+                            val upScreen = upChange?.position ?: downScreen
+                            val world = toWorld(upScreen)
+                            lastWorldPos = world
+
+                            if (!multiTouch && !panning) {
+                                // Double-tap (quick, little movement) resets zoom
+                                val now = SystemClock.elapsedRealtime()
+                                val isQuick = dragDistance < panSlopPx
+                                val dt = now - lastTapMs
+                                val distFromLast = (upScreen - lastTapPos).getDistance()
+                                if (isQuick && dt in 40L..350L && distFromLast < panSlopPx * 1.5f) {
+                                    scale = 1f
+                                    pan = Offset.Zero
+                                    lastTapMs = 0L
+                                    latestOnHover(null, null)
+                                    break
+                                }
+                                if (isQuick) {
+                                    lastTapMs = now
+                                    lastTapPos = upScreen
+                                } else {
+                                    lastTapMs = 0L
+                                }
+
+                                val pick = cellAt(world.x, world.y, latestLayout, latestPuzzle)
+                                if (pick != null) {
+                                    latestOnSelect(pick.first, pick.second)
+                                }
+                            } else {
+                                lastTapMs = 0L
+                            }
                             latestOnHover(null, null)
                             break
                         }
-                        if (!change.pressed && !change.previousPressed) {
+
+                        // Exit if nothing pressed
+                        if (pressed.isEmpty()) {
                             latestOnHover(null, null)
                             break
                         }
@@ -252,96 +450,104 @@ fun BoardCanvas(
 
         if (layout.boardW <= 0f || layout.cellSize <= 0f) return@Canvas
 
-        drawRoundRect(
-            color = Config.CELL_EMPTY,
-            topLeft = Offset(layout.boardLeft, layout.boardTop),
-            size = Size(layout.boardW, layout.boardH),
-            cornerRadius = CornerRadius(6f, 6f),
-        )
-        drawRoundRect(
-            color = Config.PANEL_BORDER,
-            topLeft = Offset(layout.boardLeft, layout.boardTop),
-            size = Size(layout.boardW, layout.boardH),
-            cornerRadius = CornerRadius(6f, 6f),
-            style = Stroke(width = 2f),
-        )
+        val pivot = Offset(size.width / 2f, size.height / 2f)
 
-        val cs = layout.cellSize
-        val rad = max(1f, min(4f, cs / 6f))
-        val hole = puzzle.holeCells
-
-        for ((r, c) in puzzle.shape) {
-            val topLeft = layout.cellTopLeft(r, c)
-            val fill = when {
-                (r to c) in puzzle.shaded -> if ((r to c) in hole) Config.HOLE_SHADE else Config.SHADE
-                (r to c) in hole -> Config.HOLE_FILL
-                else -> Config.SHAPE_FILL
-            }
+        // Clip to canvas; zoom may push content outside.
+        withTransform({
+            // Match screenToWorld / applyZoom math:
+            // screen = (world - pivot) * scale + pivot + pan
+            translate(left = pan.x, top = pan.y)
+            scale(scaleX = scale, scaleY = scale, pivot = pivot)
+        }) {
             drawRoundRect(
-                color = fill,
-                topLeft = topLeft,
-                size = Size(max(1f, cs - 1f), max(1f, cs - 1f)),
-                cornerRadius = CornerRadius(rad, rad),
+                color = Config.CELL_EMPTY,
+                topLeft = Offset(layout.boardLeft, layout.boardTop),
+                size = Size(layout.boardW, layout.boardH),
+                cornerRadius = CornerRadius(6f, 6f),
             )
-            if (cs >= 8f && (r to c) !in puzzle.shaded) {
-                val edge = if ((r to c) in hole) Config.HOLE_EDGE else Config.SHAPE_EDGE
+            drawRoundRect(
+                color = Config.PANEL_BORDER,
+                topLeft = Offset(layout.boardLeft, layout.boardTop),
+                size = Size(layout.boardW, layout.boardH),
+                cornerRadius = CornerRadius(6f, 6f),
+                style = Stroke(width = 2f),
+            )
+
+            val cs = layout.cellSize
+            val rad = max(1f, min(4f, cs / 6f))
+            val hole = puzzle.holeCells
+
+            for ((r, c) in puzzle.shape) {
+                val topLeft = layout.cellTopLeft(r, c)
+                val fill = when {
+                    (r to c) in puzzle.shaded -> if ((r to c) in hole) Config.HOLE_SHADE else Config.SHADE
+                    (r to c) in hole -> Config.HOLE_FILL
+                    else -> Config.SHAPE_FILL
+                }
                 drawRoundRect(
-                    color = edge,
+                    color = fill,
                     topLeft = topLeft,
                     size = Size(max(1f, cs - 1f), max(1f, cs - 1f)),
                     cornerRadius = CornerRadius(rad, rad),
-                    style = Stroke(width = 1f),
                 )
+                if (cs >= 8f && (r to c) !in puzzle.shaded) {
+                    val edge = if ((r to c) in hole) Config.HOLE_EDGE else Config.SHAPE_EDGE
+                    drawRoundRect(
+                        color = edge,
+                        topLeft = topLeft,
+                        size = Size(max(1f, cs - 1f), max(1f, cs - 1f)),
+                        cornerRadius = CornerRadius(rad, rad),
+                        style = Stroke(width = 1f),
+                    )
+                }
             }
-        }
 
-        for (arrow in puzzle.arrows) {
-            if (arrow.removed) continue
-            val selected = hoverArrowId == arrow.id
-            val color = arrowColor(arrow, hoverArrowId, errorArrowId, errorBlinkOn)
-            val centers = arrow.cells.map { (r, c) ->
-                val o = layout.cellToScreen(r, c)
-                o.x to o.y
-            }
-            val headDir = headDirection(arrow.cells, arrow.exitDir)
-            // Halo + thicker stroke so select reads clearly on dense Expert grids
-            if (selected) {
+            for (arrow in puzzle.arrows) {
+                if (arrow.removed) continue
+                val selected = hoverArrowId == arrow.id
+                val color = arrowColor(arrow, hoverArrowId, errorArrowId, errorBlinkOn)
+                val centers = arrow.cells.map { (r, c) ->
+                    val o = layout.cellToScreen(r, c)
+                    o.x to o.y
+                }
+                val headDir = headDirection(arrow.cells, arrow.exitDir)
+                // Halo + thicker stroke so select reads clearly on dense Expert grids
+                if (selected) {
+                    drawPolylineArrow(
+                        centers, headDir, Config.ARROW_SELECT_GLOW.copy(alpha = 0.55f), cs,
+                        thicknessScale = 1.85f,
+                    )
+                }
                 drawPolylineArrow(
-                    centers, headDir, Config.ARROW_SELECT_GLOW.copy(alpha = 0.55f), cs,
-                    thicknessScale = 1.85f,
+                    centers, headDir, color, cs,
+                    thicknessScale = if (selected) 1.35f else 1f,
                 )
             }
-            drawPolylineArrow(
-                centers, headDir, color, cs,
-                thicknessScale = if (selected) 1.35f else 1f,
-            )
-        }
 
-        for (anim in flowAnims) {
-            if (anim.done()) continue
-            // Map grid-space polyline into cropped screen space.
-            val centers = anim.polylinePoints(0f, 0f).map { (sx, sy) ->
-                // polylinePoints returns pixel coords for origin (0,0) with cellSize;
-                // convert back to grid fractional then into our layout.
-                val gridC = (sx - anim.cellSize / 2f) / anim.cellSize
-                val gridR = (sy - anim.cellSize / 2f) / anim.cellSize
-                val x = layout.originX + (gridC - layout.col0) * layout.cellSize + layout.cellSize / 2f
-                val y = layout.originY + (gridR - layout.row0) * layout.cellSize + layout.cellSize / 2f
-                x to y
-            }
-            drawPolylineArrow(centers, anim.exitDirection, Config.ARROW_FLOW_LINE, cs)
-            val n = anim.cells.size
-            if (n > 0) {
-                val idx = min(n - 1, max(0, anim.shadedCount()))
-                val (r, c) = anim.cells[idx]
-                val isHole = (r to c) in puzzle.holeCells
-                val glow = if (isHole) Config.HOLE_SHADE_GLOW else Config.SHADE_GLOW
-                val tl = layout.cellTopLeft(r, c)
-                drawRect(
-                    color = glow.copy(alpha = 0.35f),
-                    topLeft = tl,
-                    size = Size(cs - 1f, cs - 1f),
-                )
+            for (anim in flowAnims) {
+                if (anim.done()) continue
+                // Map grid-space polyline into cropped board space (may leave the frame).
+                val centers = anim.polylinePoints(0f, 0f).map { (sx, sy) ->
+                    val gridC = (sx - anim.cellSize / 2f) / anim.cellSize
+                    val gridR = (sy - anim.cellSize / 2f) / anim.cellSize
+                    val x = layout.originX + (gridC - layout.col0) * layout.cellSize + layout.cellSize / 2f
+                    val y = layout.originY + (gridR - layout.row0) * layout.cellSize + layout.cellSize / 2f
+                    x to y
+                }
+                drawPolylineArrow(centers, anim.exitDirection, Config.ARROW_FLOW_LINE, cs)
+                val n = anim.cells.size
+                if (n > 0) {
+                    val idx = min(n - 1, max(0, anim.shadedCount()))
+                    val (r, c) = anim.cells[idx]
+                    val isHole = (r to c) in puzzle.holeCells
+                    val glow = if (isHole) Config.HOLE_SHADE_GLOW else Config.SHADE_GLOW
+                    val tl = layout.cellTopLeft(r, c)
+                    drawRect(
+                        color = glow.copy(alpha = 0.35f),
+                        topLeft = tl,
+                        size = Size(cs - 1f, cs - 1f),
+                    )
+                }
             }
         }
     }

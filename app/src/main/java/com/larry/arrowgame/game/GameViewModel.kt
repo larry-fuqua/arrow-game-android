@@ -13,12 +13,10 @@ import androidx.lifecycle.viewModelScope
 import com.larry.arrowgame.data.GameStorage
 import com.larry.arrowgame.data.ScoreEntry
 import com.larry.arrowgame.data.UserProfile
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
@@ -41,6 +39,8 @@ data class CompletionInfo(
 class GameViewModel(app: Application) : AndroidViewModel(app) {
     private val storage = GameStorage(app)
     private val audio = GameAudio(app).also { it.muted = storage.isMuted() }
+    /** Warms one puzzle per difficulty and refills after each take. */
+    private val preloader = PuzzlePreloader(viewModelScope)
 
     var screen by mutableStateOf(Screen.LOGIN)
         private set
@@ -90,9 +90,33 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     private var tickJob: Job? = null
 
+    /**
+     * In-flight "take from preloader / apply to play" job only — not the warm
+     * producers. Cancelled on New / Back so a late take cannot swap the board.
+     */
+    private var playLoadJob: Job? = null
+    @Volatile
+    private var playLoadEpoch: Int = 0
+
     init {
+        // Start warming all difficulties immediately (before the player taps).
+        preloader.start()
         if (profile != null) screen = Screen.LEVELS
         ensureTicker()
+    }
+
+    /** Cancel waiting to attach a puzzle to the play screen; preloader keeps running. */
+    private fun abandonPlayLoad() {
+        playLoadJob?.cancel()
+        playLoadJob = null
+        playLoadEpoch++
+        generating = false
+    }
+
+    private fun beginPlayLoadEpoch(): Int {
+        playLoadJob?.cancel()
+        playLoadJob = null
+        return ++playLoadEpoch
     }
 
     fun statusActive(): Boolean =
@@ -111,25 +135,32 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         }
         profile = storage.makeNamedLocal(name)
         screen = Screen.LEVELS
+        preloader.start()
         setStatus("Signed in as ${profile!!.displayName}")
     }
 
     fun loginGuest() {
         profile = storage.makeGuest("Guest")
         screen = Screen.LEVELS
+        preloader.start()
         setStatus("Welcome, ${profile!!.displayName}!")
     }
 
     fun logout() {
+        abandonPlayLoad()
         storage.clearProfile()
         profile = null
         nameInput = ""
         screen = Screen.LOGIN
         puzzle = null
+        level = null
+        flowAnims.clear()
+        fireworks.clear()
     }
 
     fun startLevel(levelId: Int) {
         val lv = getLevel(levelId)
+        val token = beginPlayLoadEpoch()
         level = lv
         screen = Screen.PLAY
         playStartedMs = SystemClock.elapsedRealtime()
@@ -137,26 +168,40 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         flowAnims.clear()
         pendingComplete = false
         errorArrowId = null
+        hoverArrowId = null
         penaltyPoints = 0
-        generating = true
+        lastPointsPopup = null
+        completion = null
+        celebrationT0 = null
+        fireworks.clear()
         puzzle = null
-        viewModelScope.launch {
-            val p = withContext(Dispatchers.Default) {
-                var result: Puzzle? = null
-                var seed: Int? = null
-                for (i in 0 until 12) {
-                    val gen = generatePuzzle(lv, seed)
-                    if (verifySolvable(gen) && gen.arrows.isNotEmpty() && gen.shape.isNotEmpty()) {
-                        result = gen.copyForPlay()
-                        break
-                    }
-                    seed = null
-                }
-                result ?: generatePuzzle(lv).copyForPlay()
-            }
-            puzzle = p
+
+        // Instant path: pre-warmed buffer hit
+        val ready = preloader.tryTake(levelId)
+        if (ready != null) {
+            if (token != playLoadEpoch) return
+            puzzle = ready
             generating = false
-            if (p.shapeName.isNotEmpty()) setStatus("Shape: ${p.shapeName}", 2.5f)
+            playStartedMs = SystemClock.elapsedRealtime()
+            if (ready.shapeName.isNotEmpty()) setStatus("Shape: ${ready.shapeName}", 2.5f)
+            return
+        }
+
+        // Buffer empty (first Expert, or just consumed) — wait for producer
+        generating = true
+        playLoadJob = viewModelScope.launch {
+            try {
+                val p = preloader.take(levelId)
+                if (token != playLoadEpoch || !isActive) return@launch
+                puzzle = p
+                playStartedMs = SystemClock.elapsedRealtime()
+                if (p.shapeName.isNotEmpty()) setStatus("Shape: ${p.shapeName}", 2.5f)
+            } finally {
+                if (token == playLoadEpoch) {
+                    generating = false
+                    playLoadJob = null
+                }
+            }
         }
     }
 
@@ -166,12 +211,21 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun backToLevels() {
+        abandonPlayLoad()
         screen = Screen.LEVELS
         puzzle = null
+        level = null
         flowAnims.clear()
         pendingComplete = false
         errorArrowId = null
+        hoverArrowId = null
+        lastPointsPopup = null
+        completion = null
+        celebrationT0 = null
+        elapsedFrozen = null
         fireworks.clear()
+        // Keep preloader warm for the next pick
+        preloader.start()
     }
 
     fun replay() {

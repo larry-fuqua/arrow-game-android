@@ -250,6 +250,11 @@ private fun PlayScreen(vm: GameViewModel) {
                     color = Config.TEXT_DIM,
                     fontSize = 11.sp,
                 )
+                Text(
+                    "Pinch zoom · drag pan · double-tap reset",
+                    color = Config.TEXT_DIM,
+                    fontSize = 10.sp,
+                )
             }
         }
 
